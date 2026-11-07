@@ -55,3 +55,7 @@ This uses an OmniRoute combo called `free-chain` (create it with `omniroute comb
 - The gateway proxies `/v1/chat/completions` only. It binds to loopback; do not expose it.
 - Tested: failover on simulated 402/429 responses (normal and streaming), a real switch to OpenRouter, and Claude Code running a tool call through OmniRoute on free models. Not tested: long-running sessions or other clients.
 - Using login-based routes such as Kiro or Antigravity inside OmniRoute may breach those services' terms; they are not part of this chain.
+
+## License
+
+[MIT](LICENSE)
