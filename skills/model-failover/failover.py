@@ -21,6 +21,18 @@ import time
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import socket
+
+class ExclusiveServer(ThreadingHTTPServer):
+    """Refuses a port another process already holds. Python's default SO_REUSEADDR lets a second copy
+    share the port on Windows, and requests then go to whichever copy (possibly old code) Windows picks."""
+    allow_reuse_address = False
+
+    def server_bind(self):
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
 
 HOME = os.path.join(os.path.expanduser("~"), ".model-failover")
 CONFIG = os.environ.get("FAILOVER_CONFIG", os.path.join(HOME, "tiers.json"))
@@ -293,7 +305,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def serve(port):
     load_tiers()
-    srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)   # loopback only, on purpose
+    srv = ExclusiveServer(("127.0.0.1", port), Handler)   # loopback only, on purpose
     log("model-failover listening on http://127.0.0.1:%d/v1 (config %s)" % (port, CONFIG))
     try:
         srv.serve_forever()

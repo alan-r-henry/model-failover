@@ -1,69 +1,123 @@
 ---
 name: model-failover
-description: Keep a chat session going when a model provider runs out of credits or hits a rate limit, by switching automatically down an ordered chain (OmniRoute, then OpenRouter, then OpenCode Zen) and returning to the best one when its quota resets. Use when the user asks for automatic model fallback or switching, says credits or free usage ran out, a provider returns 402/429, or asks which provider is serving requests right now.
+description: Keep a chat session going when a model provider runs out of credits or hits a rate limit, by switching automatically down an ordered chain (OmniRoute, then OpenRouter, then OpenCode Zen) and returning to the best one when its quota resets. Also routes Claude Code chats to free models when the Claude usage limit is reached or when the user picks the free model. Use when the user asks for automatic model fallback or switching, says credits or free usage ran out, a provider returns 402/429, asks which provider is serving requests right now, or wants a chat moved to or off free models.
 ---
 
 # model-failover
 
-A small local gateway (`failover.py`, stdlib Python, no installs) that speaks the OpenAI
-chat-completions API on `http://127.0.0.1:20130/v1`. Clients send model `auto`; the gateway
-picks the first healthy tier in `~/.model-failover/tiers.json` and moves on when one fails.
+Two local, loopback-only services (stdlib Python, no installs):
 
-Default chain, in order:
+| Service | Port | For |
+|---|---|---|
+| `failover.py` | 20130 | OpenAI-compatible clients (opencode etc.): model `auto` walks a provider chain |
+| `claude-gateway.py` | 20135 (base URL) + 20136 (HTTPS proxy) | Claude Code: Claude first, free models when allowed |
 
-1. **omniroute**, the local OmniRoute router (`localhost:20128`), key in env `OMNIROUTE_API_KEY`
-2. **openrouter**, `openrouter/free`, key in env `OPENROUTER_API_KEY` (skipped until the key exists)
-3. **opencode**, OpenCode Zen free models, anonymous
+Config and logs live in `~/.model-failover/`. Never write API keys into files there or here; keys
+come from environment variables (`OMNIROUTE_API_KEY`, `OPENROUTER_API_KEY`).
 
-## How switching works
+## failover.py (OpenAI clients)
 
-- A request goes to the highest tier that is not resting. If it answers 402, 429, 401/403, 404,
-  5xx, times out or refuses the connection, the gateway tries the next tier **within the same
-  request**, so the client sees no error.
-- The failed tier then rests: until the reset time the server states (`Retry-After`,
-  `X-RateLimit-Reset`, `reset_seconds`), else 1 h for 429, 6 h for 402, 30 min for auth, 60 s for
-  blips. When the rest ends, the next request goes back to the better tier on its own.
-- If every tier is resting, it still probes the one that recovers soonest instead of refusing.
-- Streaming is supported. A stream that breaks after it began cannot be restarted; the next
-  request goes to the next tier.
-
-## Commands (PowerShell, from this folder)
+Clients send model `auto`; the gateway uses the first healthy tier in `~/.model-failover/tiers.json`:
+OmniRoute (`localhost:20128`), then `openrouter/free`, then OpenCode Zen. On 402, 429, 401/403, 404,
+5xx, timeout or refused connection it retries the next tier **in the same request**. The failed tier
+rests until the reset the server states (`Retry-After`, `X-RateLimit-Reset`, `reset_seconds`), else
+1 h for 429, 6 h for 402, 30 min for auth, 60 s for blips. If every tier rests, it probes the one that
+recovers soonest.
 
 ```powershell
-./start-gateway.ps1                       # start in background (no-op if running)
-python failover.py status                 # active tier + why others are resting
-python failover.py test                   # one tiny request through the chain
-Get-Content ~\.model-failover\failover.log -Tail 20   # switch history with error detail
+python failover.py status      # active tier and why others rest
+python failover.py test        # one tiny request through the chain
 ```
 
-opencode is already configured (`~/.config/opencode/opencode.jsonc`, model `failover/auto`).
-Any other OpenAI-compatible tool: base URL `http://127.0.0.1:20130/v1`, model `auto`, any key.
+## claude-gateway.py (Claude Code, terminal and desktop app)
 
-## When Claude's own 5-hour (or weekly) limit runs out
+All Claude Code traffic reaches the gateway through `~/.claude/settings.json`:
 
-Claude Code sends its traffic straight to Anthropic, and the endpoint is fixed when it starts,
-so a running Claude Code session cannot be switched in mid-flight. What works instead:
+```json
+"env": { "HTTPS_PROXY": "http://127.0.0.1:20136",
+         "NODE_EXTRA_CA_CERTS": "C:\\Users\\<you>\\.model-failover\\tls\\api-anthropic.pem" },
+"modelOverrides": { "claude-opus-4-6": "free" }
+```
+
+The proxy on 20136 intercepts only `api.anthropic.com` (with a local self-signed certificate that only
+Claude Code trusts, through `NODE_EXTRA_CA_CERTS`) and tunnels every other host untouched. This is what
+lets desktop-app chats use the gateway, since the app overrides `ANTHROPIC_BASE_URL`.
+
+### When a request goes to free models
+
+1. **The user picked the free model** (Opus 4.6 in the model picker, mapped to `free` by
+   `modelOverrides`): always free, in any chat. In a work-folder chat the reply note warns that the
+   conversation goes to the free providers. If the free chain fails, Claude answers instead.
+2. **Claude's usage limit is reached** (429/402 with a long reset, or limit wording): only chats on
+   the **free list** move to free automatically, until the reset. Every other chat gets Anthropic's
+   own limit reply and the user can switch it to Opus 4.6.
+3. Chats whose working folder matches `never_free_dirs` never move automatically, even if listed.
+
+The first reply on a new backend starts with a one-line note ("Free model in use ...", "This chat
+isn't on your free list ...", "Work project ..."). Anthropic credentials are never sent to the free tier.
+
+`~/.model-failover/claude-gateway.json`:
+
+```json
+{ "never_free_dirs": ["your-work-repo"],     // folder-name substrings: no automatic failover
+  "free_sessions":   ["<session id>", ...],  // the free list (managed by migrate-sessions.py)
+  "fallback_model":  "claude-opus-5-5" }     // Claude model used when the free chain fails
+```
+
+### Free list (opt-in)
 
 ```powershell
-./claude-free.ps1                    # continue the last conversation in this folder on free models
-./claude-free.ps1 -New               # fresh conversation on free models
-./claude-free.ps1 --print "question" # one-shot (use --print; PowerShell eats a bare -p)
+python migrate-sessions.py                                        # list chats, environment, model
+python migrate-sessions.py --free-set "youtube manager" --apply   # exactly these chats are free
+python migrate-sessions.py --free-add "spotify" --apply
+python migrate-sessions.py --free-remove "youtube" --apply
+python migrate-sessions.py --undo                                 # restore the last --apply
 ```
 
-It launches Claude Code against OmniRoute's Anthropic-format endpoint (`/v1/messages`) using the
-OmniRoute combo `free-chain` for every model slot, scoped to that one launch. `free-chain` is a
-priority list: NVIDIA Nemotron, then `openrouter/free`, then an OpenRouter free model; OmniRoute
-moves down it when an entry fails. Tool calls work (tested: it created a file, and a combo with a
-broken first entry was served by OpenRouter). Edit the list with `omniroute combo` or the
-dashboard. OpenCode Zen is not in this combo (its free quota is exhausted and unreliable).
-When the limit resets, just start plain `claude` again.
+Names match part of a chat title. `--free-*` saves the free list and moves the named desktop chats to
+the "Free Chat" environment on Opus 4.6; chats taken off it get back the model they had before. It
+edits the desktop app's own chat files, so **quit the app first** (the script refuses otherwise).
+Work-folder chats are never added. A forked or new session has a new id: add it again.
 
-## Limits to know
+### What the gateway fixes in free replies
 
-- Free quotas reset **daily or by provider rule, not monthly**. OpenRouter `:free` resets at the
-  UTC day boundary (50 requests/day until $10 of credits has ever been bought, then 1000).
-- The gateway proxies `/v1/chat/completions` only. Claude Code uses `claude-free.ps1` instead.
-- Free models differ in tool-calling and context quality; a switch can change answer quality.
-- Adding a tier: append an object to `tiers.json` (`name`, `base_url`, `key_env`, `model`).
-  Never write keys into that file; put them in environment variables.
-- The gateway binds to loopback only. Do not change that.
+- Strips Anthropic-signed thinking blocks and Claude-only request fields.
+- **Message threads:** Claude Code may send only "continue thread X" plus new turns, with tools and
+  history stored at Anthropic. The free chain has neither, so the gateway answers
+  `thread_unsupported_request`; Claude Code then resends full requests for that session.
+- **Tool calls written as text** (`<tool_call><function=Bash>...`, `<tool_call>{json}`, or
+  `<invoke name="..."><parameter name="...">` in any wrapper) are converted into real `tool_use`
+  blocks for tools the request declared; earlier such turns in the history are replaced by a note so
+  the model stops copying them. Because of this, free replies with tools are buffered, not streamed.
+  An unconvertible one is saved to `~/.model-failover/last-unrepaired-free-reply.txt`.
+
+### Running it
+
+```powershell
+powershell -ExecutionPolicy Bypass -File restart-gateway.ps1   # stop every copy, start one of each
+python claude-gateway.py status                                 # counters, free list, work folders
+Get-Content ~\.model-failover\claude-gateway.log -Tail 20
+```
+
+`launch-hidden.vbs` starts OmniRoute and both services with no window; run it from a login task
+(optionally repeating every 10 minutes as a watchdog: each service refuses a port that is already
+taken, so repeats are harmless). Because every Claude Code chat goes through the proxy, **if the
+gateway is down Claude Code cannot connect**: restart it, or remove `HTTPS_PROXY` from settings.json.
+
+### Manual helpers
+
+- `claude-free.ps1 [-New] [-Folder <dir> -Resume <id>] [--print "q"]`: run one terminal session on
+  free models through `/free`.
+- `free-resume.py`: pick a recent chat and reopen it on free models with `claude-free.ps1`.
+- `claude-failover.ps1 -Enable/-Disable <folder> | -GlobalOn | -GlobalOff | -Status`: older
+  base-URL routing for terminal sessions.
+
+## Limits
+
+- Free quotas reset daily or by provider rule, not monthly.
+- Free models have smaller context windows and weaker tool use; `/compact` long chats.
+- Switching a chat between Claude and free models loses Claude's prompt cache for it.
+- Regular claude.ai chats (the Chat tab) run on Anthropic's servers and cannot be routed.
+- The real Anthropic limit reply has only been simulated; detection uses reset headers and limit
+  wording. Check the log after a real limit.
+- Keep both services on loopback.

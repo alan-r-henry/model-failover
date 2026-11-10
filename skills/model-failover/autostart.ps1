@@ -19,3 +19,11 @@ if (-not (Get-NetTCPConnection -LocalPort 20128 -State Listen -ErrorAction Silen
     $null = Wait-Port 20128 90
 }
 & (Join-Path $PSScriptRoot 'start-gateway.ps1')
+
+# Claude-limit gateway (only used by project folders that opted in with claude-failover.ps1).
+if (-not (Get-NetTCPConnection -LocalPort 20135 -State Listen -ErrorAction SilentlyContinue)) {
+    $py = (Get-Command python -ErrorAction SilentlyContinue).Source
+    if ($py) {
+        Start-Process $py -ArgumentList '-u', (Join-Path $PSScriptRoot 'claude-gateway.py'), 'serve', '--port', '20135' -WindowStyle Hidden
+    }
+}
