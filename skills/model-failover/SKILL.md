@@ -90,6 +90,13 @@ Work-folder chats are never added. A forked or new session has a new id: add it 
   blocks for tools the request declared; earlier such turns in the history are replaced by a note so
   the model stops copying them. Because of this, free replies with tools are buffered, not streamed.
   An unconvertible one is saved to `~/.model-failover/last-unrepaired-free-reply.txt`.
+- **Language drift:** every free request carries an "answer in English" rule (system prompt and newest
+  turn). Free replies are buffered; one with Chinese/Japanese/Korean prose, when the user's recent
+  messages have none, is retried once with a stronger rule (log: "free reply was not in English").
+- Log lines: "checked for text tool calls (tools=N)" for chat turns; "relayed without tool-call check
+  (tools=0)" is normal for the app's small side requests (titles, progress labels), which have no tools.
+- Debugging: create `~/.model-failover/dump-shape` (optionally containing a session id) and the next
+  full request is written to `last-request-shape.json` as structure only, with text left out.
 
 ### Running it
 
@@ -100,7 +107,7 @@ Get-Content ~\.model-failover\claude-gateway.log -Tail 20
 ```
 
 `launch-hidden.vbs` starts OmniRoute and both services with no window; run it from a login task
-(optionally repeating every 10 minutes as a watchdog: each service refuses a port that is already
+(optionally repeating every 2 minutes as a watchdog: each service refuses a port that is already
 taken, so repeats are harmless). Because every Claude Code chat goes through the proxy, **if the
 gateway is down Claude Code cannot connect**: restart it, or remove `HTTPS_PROXY` from settings.json.
 

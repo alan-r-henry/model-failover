@@ -129,7 +129,60 @@ def strip_for_free(payload):
             m["content"] = [b for b in c if not (isinstance(b, dict) and b.get("type") in ("thinking", "redacted_thinking"))] or [{"type": "text", "text": "(continued)"}]
         if m.get("role") == "assistant" and tools:
             _scrub_text_tool_calls(m, tools)
+    _add_language_rule(p)
     return p
+
+
+# Some free models (openrouter/free routes to many) drift into Chinese mid-chat, and once one reply is in
+# the history the next models copy it. Pin the language in the system prompt and next to the newest turn.
+LANGUAGE_RULE = ("Write every reply in English unless the user's own latest message is written in another "
+                 "language. Earlier assistant turns written in another language were mistakes: do not copy them.")
+
+
+_CJK = re.compile("[぀-ヿ㐀-鿿가-힯]")
+_CJK_ESC = re.compile(rb"\\u(?:30[4-9a-f][0-9a-f]|3[4-9a-f][0-9a-f]{2}|[4-9][0-9a-f]{3}|a[c-f][0-9a-f]{2}|[bc][0-9a-f]{3}|d[0-7][0-9a-f]{2})", re.I)
+
+
+def _user_text(p):
+    out = []
+    for m in p.get("messages") or []:
+        if m.get("role") != "user":
+            continue
+        c = m.get("content")
+        if isinstance(c, str):
+            out.append(c)
+        elif isinstance(c, list):
+            out += [b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text"]
+    return "\n".join(out[-6:])
+
+
+def _drifted(raw, payload):
+    """True when the reply has Chinese/Japanese/Korean text but the user's recent messages do not.
+    Only the reply's prose counts (SSE text deltas and JSON text blocks, raw or \\u-escaped), not tool
+    inputs, which may legitimately quote such text."""
+    if _CJK.search(_user_text(payload)):
+        return False
+    blob = b"".join(re.findall(rb'"text"\s*:\s*"((?:[^"\\]|\\.)*)"', raw))
+    if _CJK_ESC.search(blob):
+        return True
+    return bool(_CJK.search(blob.decode("utf-8", "replace")))
+
+
+def _add_language_rule(p, strong=False):
+    s = p.get("system")
+    if isinstance(s, list):
+        s.append({"type": "text", "text": LANGUAGE_RULE})
+    else:
+        p["system"] = ((s + "\n\n") if isinstance(s, str) and s else "") + LANGUAGE_RULE
+    msgs = p.get("messages") or []
+    if msgs and msgs[-1].get("role") == "user":
+        c = msgs[-1].get("content")
+        tip = ("(Important: reply ONLY in English. Do not write any Chinese.)" if strong
+               else "(Reply in English unless I wrote in another language.)")
+        if isinstance(c, str):
+            msgs[-1]["content"] = c + "\n\n" + tip
+        elif isinstance(c, list):
+            c.append({"type": "text", "text": tip})
 
 
 def _scrub_text_tool_calls(m, tools):
@@ -318,6 +371,51 @@ def repair_free_body(raw, content_type, tools):
     except ValueError:
         return None
     return json.dumps(msg).encode() if isinstance(msg, dict) and repair_message(msg, tools) else None
+
+
+def _shape(v, depth=0):
+    """Structure of a request with the text left out (debugging aid)."""
+    if depth > 6:
+        return "..."
+    if isinstance(v, dict):
+        out = {}
+        for k, x in v.items():
+            if k in ("text", "content", "data", "signature", "thinking") and isinstance(x, str):
+                out[k] = "<str %d>" % len(x)
+            elif k == "name" and isinstance(x, str):
+                out[k] = x
+            elif k in ("input_schema", "input"):
+                out[k] = "<%s>" % type(x).__name__
+            else:
+                out[k] = _shape(x, depth + 1)
+        return out
+    if isinstance(v, list):
+        items = [_shape(x, depth + 1) for x in v]
+        seen, uniq = set(), []
+        for it in items:            # keep one example of each distinct shape
+            key = json.dumps(it, sort_keys=True)[:400]
+            if key not in seen:
+                seen.add(key)
+                uniq.append(it)
+        return uniq[:12] + (["... %d items" % len(v)] if len(v) > 12 else [])
+    if isinstance(v, str):
+        return "<str %d>" % len(v)
+    return v
+
+
+def _maybe_dump_shape(pl):
+    """Armed by creating ~/.model-failover/dump-shape; its text, if any, must appear in metadata.user_id."""
+    flag = os.path.join(HOME, "dump-shape")
+    if os.path.exists(flag) and "thread" not in pl:
+        try:
+            want = open(flag, encoding="utf-8").read().strip()
+            if want and want not in str((pl.get("metadata") or {}).get("user_id", "")):
+                return
+            os.remove(flag)
+            with open(os.path.join(HOME, "last-request-shape.json"), "w", encoding="utf-8") as f:
+                json.dump(_shape(pl), f, indent=1)
+        except OSError:
+            pass
 
 
 class _Buffered:
@@ -640,7 +738,9 @@ class Handler(BaseHTTPRequestHandler):
         route = path.split("?")[0]
         if self.command == "POST" and route in ("/v1/messages", "/v1/messages/count_tokens"):
             try:
-                want = str(json.loads(body or b"{}").get("model", "")).lower()
+                _pl = json.loads(body or b"{}")
+                _maybe_dump_shape(_pl)
+                want = str(_pl.get("model", "")).lower()
             except ValueError:
                 want = ""
             if want in FREE_ALIASES or want.startswith("free-"):
@@ -770,10 +870,29 @@ class Handler(BaseHTTPRequestHandler):
             raise
         _state["to_free"] += 1
         tools = {t.get("name"): t.get("input_schema") or {} for t in payload.get("tools") or [] if isinstance(t, dict)}
-        if not tools or resp.status != 200:
-            log("free reply relayed without tool-call check (tools=%d, status=%s)" % (len(tools), resp.status))
+        raw = resp.read() if resp.status == 200 else None    # free replies are buffered so they can be checked
+        if raw is not None and _drifted(raw, payload):
+            # One model in the free pool switched language; the pool picks again on a retry.
+            retry = json.loads(json.dumps(payload))
+            _add_language_rule(retry, strong=True)
+            req2 = urllib.request.Request(req.full_url, data=json.dumps(retry).encode(), headers=dict(req.header_items()),
+                                          method="POST")
+            try:
+                resp2 = _NO_PROXY_OPENER.open(req2, timeout=600)
+                raw2 = resp2.read()
+                if resp2.status == 200:
+                    log("free reply was not in English: retried once (%s)" %
+                        ("retry still drifted, sent anyway" if _drifted(raw2, payload) else "retry is fine"))
+                    resp, raw = resp2, raw2
+            except (OSError, http.client.HTTPException) as e:
+                log("free reply was not in English; retry failed (%s), sending the first reply" % e)
         if tools and resp.status == 200:
-            raw = resp.read()
+            log("free reply checked for text tool calls (tools=%d)" % len(tools))
+        else:
+            log("free reply relayed without tool-call check (tools=%d, status=%s)" % (len(tools), resp.status))
+            if raw is not None:
+                resp = _Buffered(resp, raw)
+        if tools and resp.status == 200:
             fixed = repair_free_body(raw, resp.headers.get("Content-Type") or "", tools)
             if fixed is not None:
                 log("free reply had tool calls written as text: converted to real tool calls")

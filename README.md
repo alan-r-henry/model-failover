@@ -61,7 +61,7 @@ Free models need some repairs to work with Claude Code, which the gateway does:
    ```json
    { "never_free_dirs": ["my-work-repo"], "free_sessions": [], "fallback_model": "claude-opus-5-5" }
    ```
-6. Start the services: `powershell -ExecutionPolicy Bypass -File restart-gateway.ps1`. To start them at login, point a scheduled task at `wscript.exe //B launch-hidden.vbs`, optionally repeating every 10 minutes as a watchdog.
+6. Start the services: `powershell -ExecutionPolicy Bypass -File restart-gateway.ps1`. To start them at login, point a scheduled task at `wscript.exe //B launch-hidden.vbs`, optionally repeating every 2 minutes as a watchdog.
 7. Quit the Claude desktop app, then add chats to the free list:
    ```bash
    python migrate-sessions.py --free-set "my chat title" --apply
@@ -70,6 +70,8 @@ Free models need some repairs to work with Claude Code, which the gateway does:
 ## Things to know
 
 - **The gateway must be running.** Every Claude Code chat goes through its proxy, so if it is down Claude Code cannot connect. Restart it, or remove `HTTPS_PROXY` from `settings.json`.
+- **Don't stop processes by name.** The services run as `pythonw`. A script or chat that runs `Get-Process pythonw | Stop-Process` (or `taskkill /IM pythonw.exe`) kills the gateway and disconnects every chat until the watchdog restarts it. Stop processes by PID or command line instead.
+- Some models in a free pool such as `openrouter/free` drift into another language. Free requests carry an "answer in English" rule, and a reply in Chinese, Japanese or Korean (when your own messages are not) is retried once. Free replies are buffered for these checks, so they arrive all at once instead of streaming.
 - `migrate-sessions.py` edits the desktop app's own chat files. That is unsupported by the app, so it refuses to run while the app is open and records every change for `--undo`.
 - Free models have smaller context windows and weaker tool use than Claude. Compact long chats, and expect lower quality.
 - Moving a chat between Claude and free models discards Claude's prompt cache for it, so the next Claude turn costs more.
